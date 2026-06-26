@@ -1,0 +1,56 @@
+services:
+  postgres_small:
+    image: postgres:16-alpine
+    container_name: pg_tuning_small
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${PG_SMALL_DB:-payment_small}
+    ports:
+      - "${PG_SMALL_PORT:-5434}:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./data-small.sql:/docker-entrypoint-initdb.d/02-data.sql
+      - pg_small_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${PG_SMALL_DB:-payment_small}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres_large:
+    image: postgres:16-alpine
+    container_name: pg_tuning_large
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${PG_LARGE_DB:-payment_large}
+    ports:
+      - "${PG_LARGE_PORT:-5433}:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./data-large.sql:/docker-entrypoint-initdb.d/02-data.sql
+      - pg_large_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${PG_LARGE_DB:-payment_large}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  pg_small_data:
+  pg_large_data:
