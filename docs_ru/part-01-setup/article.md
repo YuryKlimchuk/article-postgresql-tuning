@@ -39,7 +39,7 @@ docker/
 
 ### docker-compose.yml
 
-Два контейнера PostgreSQL 16 на базе Alpine. Полный файл — [в репозитории](https://github.com/.../blob/main/docker/docker-compose.yml).
+Два контейнера PostgreSQL 16 на базе Alpine. Полный файл — [в репозитории](https://github.com/YuryKlimchuk/article-postgresql-tuning/blob/master/docker/docker-compose.yml).
 
 Обратите внимание: мы включаем расширение `pg_stat_statements` — оно понадобится в следующих частях для анализа производительности запросов.
 
@@ -121,7 +121,7 @@ erDiagram
     }
 ```
 
-*Полный DDL: [schema.sql](https://github.com/.../blob/main/docker/schema.sql)*
+*Полный DDL: [schema.sql](https://github.com/YuryKlimchuk/article-postgresql-tuning/blob/master/docker/schema.sql)*
 
 Некоторые вещи могут вам показаться странными, но не переживайте, это сделано умышленно в учебных целях.
 
