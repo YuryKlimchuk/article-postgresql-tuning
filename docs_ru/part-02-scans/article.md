@@ -596,50 +596,130 @@ SELECT card_id, amount FROM transactions WHERE card_id = 1;
 
 ### Двухфазный подход
 
-Иногда строк много, но недостаточно для Seq Scan. PostgreSQL использует хитрый трюк:
+Иногда строк много (~10-40% таблицы), но недостаточно для Seq Scan. Index Scan тоже плох: он будет прыгать по таблице в случайном порядке за каждой строкой.
 
-1. **Bitmap Index Scan** — проходит по индексу, строит битовую карту страниц, которые содержат нужные строки
-2. **Bitmap Heap Scan** — идёт в таблицу и читает страницы **в физическом порядке** (а не в логическом порядке индекса)
+PostgreSQL использует двухфазный трюк:
 
-Это эффективнее, чем Index Scan, когда нужно выбрать много строк: вместо случайных чтений для каждой строки, PostgreSQL читает страницы пачками.
+1. **Bitmap Index Scan** — проходит по индексу и строит в памяти битовую карту: «страница 5 — нужна (1), страница 6 — не нужна (0)»
+2. **Bitmap Heap Scan** — идёт в таблицу и читает страницы **в физическом порядке** (по номеру страницы), а не в логическом порядке индекса
 
-### Пример: диапазон
+**Аналогия:** нужно собрать 50 книг из библиотеки. Index Scan — берёте список, бежите к первой книге на 3-й этаж, потом ко второй в подвал, потом к третьей на 1-й этаж. Bitmap Scan — сначала отмечаете на плане нужные полки, потом спокойно идёте от входа к выходу, собирая книги по пути. Физический порядок радикально снижает нагрузку на диск.
 
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM transactions WHERE card_id BETWEEN 100 AND 500;
-```
+### Пример: чистая битовая карта
 
-Если диапазон возвращает тысячи строк, вы увидите:
+Вернёмся к эксперименту из раздела 2. Одна валюта (20% строк) на малой БД — это Bitmap Heap Scan:
+
+**Малая БД (50K строк, 1 валюта = 10 000 строк / 20%):**
 
 ```
 Bitmap Heap Scan on transactions
-  ->  Bitmap Index Scan using idx_transactions_card_id
-        Index Cond: ((card_id >= 100) AND (card_id <= 500))
+  (cost=113.00..1457.72 rows=9898 width=155)
+  (actual time=0.654..3.568 rows=10000 loops=1)
+  Recheck Cond: (currency_numeric = 643)
+  Heap Blocks: exact=1221
+  Buffers: shared hit=1239
+  ->  Bitmap Index Scan on idx_transactions_currency_numeric
+        (cost=0.00..110.53 rows=9898 width=0)
+        (actual time=0.505..0.505 rows=10009 loops=1)
+        Index Cond: (currency_numeric = 643)
+        Buffers: shared hit=18
+  Execution Time: 4.253 ms
 ```
 
-### Несколько условий
+`Heap Blocks: exact=1221` — все 1221 страница таблицы прочитаны точно, Recheck не потребовался (данных мало → битовая карта точная).
 
-Битовые карты можно комбинировать через `OR` и `AND`:
+### Несколько условий: BitmapOr и BitmapAnd
+
+Битовые карты можно комбинировать. PostgreSQL строит отдельную карту для каждого индекса и объединяет их:
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM transactions
-WHERE card_id = 123 OR merchant_id = 5;
+WHERE card_id = 1 OR merchant_id = 5;
 ```
 
-Вы увидите:
+**Малая БД:**
 
 ```
 Bitmap Heap Scan on transactions
+  (cost=8.79..98.43 rows=25 width=155)
+  (actual time=0.038..0.039 rows=25 loops=1)
+  Recheck Cond: ((card_id = 1) OR (merchant_id = 5))
+  Heap Blocks: exact=1
+  Buffers: shared hit=4 read=1
   ->  BitmapOr
-        ->  Bitmap Index Scan using idx_transactions_card_id
-              Index Cond: (card_id = 123)
-        ->  Bitmap Index Scan using idx_transactions_merchant_id
+        ->  Bitmap Index Scan on idx_tx_card_amount_include
+              Index Cond: (card_id = 1)
+        ->  Bitmap Index Scan on idx_transactions_merchant_id
               Index Cond: (merchant_id = 5)
+  Execution Time: 0.070 ms
 ```
 
-PostgreSQL построил две битовые карты и объединил их через `OR`.
+**Большая БД:**
+
+```
+Bitmap Heap Scan on transactions
+  (cost=9.04..92.63 rows=21 width=214)
+  (actual time=0.048..0.049 rows=5 loops=1)
+  Recheck Cond: ((card_id = 1) OR (merchant_id = 5))
+  Heap Blocks: exact=1
+  Buffers: shared hit=5 read=2
+  ->  BitmapOr
+        ->  Bitmap Index Scan on idx_tx_card_amount_include
+        ->  Bitmap Index Scan on idx_transactions_merchant_id
+  Execution Time: 0.086 ms
+```
+
+Две битовые карты → `BitmapOr` → одно чтение таблицы. Это позволяет использовать несколько индексов одновременно — то, чего не умеет обычный Index Scan.
+
+### Главная ловушка: work_mem и Lossy Pages
+
+Битовая карта строится в оперативной памяти. Её размер ограничен параметром `work_mem` (по умолчанию 4 МБ). Что если карта не влезает?
+
+PostgreSQL не падает. Он переключается в режим **lossy** (потерянный): вместо бита на каждую строку запоминает бит на целую страницу. «Страница 42 — нужна, но какие именно строки в ней подходят — не помню».
+
+Следствие: при чтении таблицы PostgreSQL читает страницу целиком и **перепроверяет каждую строку** (Recheck). Если страница большая, а подходящих строк мало — масса лишней работы.
+
+**Эксперимент:** принудительный Bitmap Scan на 2M строк (40% большой БД) с крошечным work_mem:
+
+```sql
+SET enable_seqscan = OFF;
+SET enable_indexscan = OFF;
+SET work_mem = '64kB';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE currency_numeric IN (643, 840);
+```
+
+```
+Bitmap Heap Scan on transactions
+  (cost=20746..239374 rows=1998667 width=214)
+  (actual time=203.302..931.136 rows=2000000 loops=1)
+  Recheck Cond: (currency_numeric = ANY ('{643,840}'::integer[]))
+  Rows Removed by Index Recheck: 2994736
+  Heap Blocks: exact=275 lossy=155976
+  Buffers: shared hit=4 read=157820
+  Execution Time: 981.754 ms
+```
+
+Кошмар: `lossy=155976` страниц из 156251 — почти всё «потеряно». `Rows Removed by Index Recheck: 2 994 736` — 3 миллиона строк прочитано и выброшено при перепроверке.
+
+**Тот же запрос с work_mem = 4MB:**
+
+```
+Bitmap Heap Scan on transactions
+  (cost=20746..231629 rows=1998667 width=214)
+  (actual time=78.787..733.574 rows=2000000 loops=1)
+  Recheck Cond: (currency_numeric = ANY ('{643,840}'::integer[]))
+  Rows Removed by Index Recheck: 1897361
+  Heap Blocks: exact=57431 lossy=98820
+  Buffers: shared hit=1 read=157820
+  Execution Time: 787.641 ms
+```
+
+`lossy` упал с 155K до 98K страниц, `Rows Removed` с 3M до 1.9M, время с 982ms до 788ms. Но сам принудительный Bitmap всё равно медленнее естественного Seq Scan (624ms — см. раздел 2).
+
+**Практический вывод:** если видите в `EXPLAIN` слова `lossy` и `Rows Removed by Index Recheck` — запросу не хватает `work_mem`. Увеличьте его для сессии (`SET work_mem = '64MB'`) или глобально в `postgresql.conf`. А ещё лучше — проверьте, не справится ли Seq Scan быстрее на таком объёме.
 
 ---
 
