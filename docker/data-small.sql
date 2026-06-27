@@ -103,11 +103,8 @@ FROM user_cards uc
 CROSS JOIN generate_series(1, 25) AS i
 CROSS JOIN LATERAL (SELECT id FROM merchants ORDER BY random() LIMIT 1) m
 CROSS JOIN LATERAL (
-    SELECT * FROM (VALUES
-        (643, 'RUB'), (840, 'USD'), (978, 'EUR'), (826, 'GBP'), (156, 'CNY')
-    ) AS v(code_num, code_alpha)
-    ORDER BY random()
-    LIMIT 1
+    SELECT (ARRAY[643, 840, 978, 826, 156])[1 + (i % 5)] AS code_num,
+           (ARRAY['RUB', 'USD', 'EUR', 'GBP', 'CNY'])[1 + (i % 5)] AS code_alpha
 ) AS curr;
 
 -- ============================================
