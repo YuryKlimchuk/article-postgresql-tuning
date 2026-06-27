@@ -31,6 +31,19 @@ CROSS JOIN LATERAL (
 ) AS curr;
 
 -- ============================================
+-- USERS (500,000 records)
+-- ============================================
+INSERT INTO users (email, localized_names)
+SELECT
+    'user' || i || '@test.com',
+    jsonb_build_object(
+        'en', 'Customer ' || i,
+        'ru', 'Пользователь ' || i,
+        'zh', '用户 ' || i
+    )
+FROM generate_series(1, 500000) AS i;
+
+-- ============================================
 -- MERCHANTS (100 records)
 -- ============================================
 INSERT INTO merchants (id, name_en, name_ru, name_zh, category, country_code)
@@ -51,19 +64,6 @@ SELECT
         ELSE 'CN'
     END
 FROM generate_series(1, 100) AS i;
-
--- ============================================
--- USERS (500,000 records)
--- ============================================
-INSERT INTO users (email, localized_names)
-SELECT
-    'user' || i || '@test.com',
-    jsonb_build_object(
-        'en', 'Customer ' || i,
-        'ru', 'Пользователь ' || i,
-        'zh', '用户 ' || i
-    )
-FROM generate_series(1, 500000) AS i;
 
 -- ============================================
 -- USER CARDS (1,000,000 records)
@@ -120,6 +120,9 @@ ANALYZE card_templates;
 ANALYZE user_cards;
 ANALYZE merchants;
 ANALYZE transactions;
+
+-- Update visibility map (required for Index Only Scan to skip heap fetches)
+VACUUM;
 
 -- ============================================
 -- SUMMARY: table sizes and row counts

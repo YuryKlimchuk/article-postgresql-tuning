@@ -119,6 +119,9 @@ ANALYZE user_cards;
 ANALYZE merchants;
 ANALYZE transactions;
 
+-- Update visibility map (required for Index Only Scan to skip heap fetches)
+VACUUM;
+
 -- ============================================
 -- SUMMARY: table sizes and row counts
 -- ============================================
