@@ -435,66 +435,140 @@ SELECT * FROM user_cards WHERE user_id = 1 AND status = 'ACTIVE';
 
 ### Проблема Index Scan
 
-Index Scan всё равно ходит в таблицу за колонками, которых нет в индексе. Это дополнительные I/O операции.
-
-### Решение: покрывающий индекс
-
-Если все нужные колонки есть в индексе, PostgreSQL может ответить, **не заглядывая в таблицу**. Это называется **Index Only Scan**.
-
-#### Пример
+Index Scan всегда ходит в таблицу (heap) за колонками, которых нет в индексе. Даже если вам нужны только `card_id` и `amount`, а индекс только на `card_id` — PostgreSQL читает и индекс, и таблицу.
 
 ```sql
--- Запрос выбирает только card_id и amount
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT card_id, amount FROM transactions WHERE card_id = 42;
+SELECT card_id, amount FROM transactions WHERE card_id = 1;
 ```
 
-Если индекс только на `card_id`:
+**Малая БД:**
 
 ```
 Index Scan using idx_transactions_card_id on transactions
-  Index Cond: (card_id = 42)
+  (cost=0.29..8.73 rows=25 width=14)
+  (actual time=0.044..0.049 rows=25 loops=1)
+  Index Cond: (card_id = 1)
+  Buffers: shared hit=3
+  Execution Time: 0.077 ms
 ```
 
-PostgreSQL всё равно идёт в таблицу за `amount` (его нет в индексе).
+`width=14` (только card_id + amount, без description), но всё равно Index Scan — потому что `amount` нет в индексе.
 
-Создаём покрывающий индекс:
+### Решение: покрывающий индекс
+
+Если **все** колонки из `SELECT` и `WHERE` есть в индексе, PostgreSQL может ответить, не заглядывая в таблицу. Это **Index Only Scan**.
 
 ```sql
 CREATE INDEX idx_tx_card_amount ON transactions(card_id, amount);
-
--- Обновляем статистику, чтобы планировщик знал о новом индексе
 ANALYZE transactions;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT card_id, amount FROM transactions WHERE card_id = 1;
 ```
 
-Теперь тот же запрос:
+**Малая БД:**
 
 ```
 Index Only Scan using idx_tx_card_amount on transactions
-  Index Cond: (card_id = 42)
+  (cost=0.29..4.73 rows=25 width=14)
+  (actual time=0.022..0.024 rows=25 loops=1)
+  Index Cond: (card_id = 1)
+  Heap Fetches: 0
+  Buffers: shared hit=1 read=2
+  Execution Time: 0.039 ms
 ```
 
-**Index Only Scan!** PostgreSQL ответил, используя только индекс.
+`Heap Fetches: 0` — ни одного захода в таблицу! PostgreSQL ответил, используя только индекс.
 
-### Сравнение Buffers
+Сравним:
 
-Запустите оба варианта с `BUFFERS` и сравните:
-- Index Scan: больше `shared hit/read` (читает и индекс, и таблицу)
-- Index Only Scan: меньше `shared hit/read` (читает только индекс)
+| Метрика | Index Scan (без amount в индексе) | Index Only Scan (покрывающий) | Разница |
+|---------|-----------------------------------|-------------------------------|---------|
+| **Buffers** | 3 hit | 1 hit + 2 read | ~одинаково (индекс маленький) |
+| **Heap Fetches** | (всегда ходит в таблицу) | **0** | Таблица не читается |
+| **Execution Time** | 0.077 ms | 0.039 ms | **×2 быстрее** |
+| **cost** | 0.29..8.73 | 0.29..4.73 | Общая стоимость вдвое ниже |
 
-### Ограничение: Visibility Map
+На малых объёмах разница скромная. Но на таблицах в миллионы строк, где heap не влезает в кэш, Index Only Scan даёт радикальный выигрыш — просто потому что не читает таблицу.
 
-Index Only Scan не всегда работает идеально. PostgreSQL использует **Visibility Map** — битовую карту, которая отмечает страницы, где все строки видны всем активным транзакциям. Если страница «чистая» (все транзакции завершены, не было UPDATE/DELETE), Index Only Scan не идёт в таблицу. Если страница «грязная» — PostgreSQL всё равно заглянет в heap, чтобы проверить видимость конкретной строки.
+### INCLUDE-индекс (PostgreSQL 11+)
 
-Именно поэтому в скриптах инициализации мы добавили `VACUUM` после загрузки данных — он обновляет Visibility Map. Без `VACUUM` даже покрывающий индекс будет ходить в таблицу.
+Что если `amount` нужен только в `SELECT`, но не в `WHERE`? Добавлять его в составной индекс `(card_id, amount)` — значит раздувать B-tree и замедлять поиск по `card_id`.
 
-В выводе `EXPLAIN (ANALYZE, BUFFERS)` смотрите на строку:
+Решение — **INCLUDE**: колонка хранится в листьях индекса, но не участвует в поиске:
+
+```sql
+CREATE INDEX idx_tx_card_amount_include ON transactions(card_id) INCLUDE (amount);
+```
+
+- Поиск идёт только по `card_id` — B-tree компактный
+- `amount` лежит в листьях — Index Only Scan работает
+
+**Малая БД:**
 
 ```
-Heap Fetches: 42
+Index Only Scan using idx_tx_card_amount_include on transactions
+  (cost=0.29..8.73 rows=25 width=14)
+  (actual time=0.020..0.022 rows=25 loops=1)
+  Index Cond: (card_id = 1)
+  Heap Fetches: 0
+  Buffers: shared hit=1 read=2
+  Execution Time: 0.036 ms
 ```
 
-Это количество заходов в таблицу. В идеале — `Heap Fetches: 0`.
+**Большая БД:**
+
+```
+Index Only Scan using idx_tx_card_amount_include on transactions
+  (cost=0.43..8.80 rows=21 width=14)
+  (actual time=0.026..0.027 rows=5 loops=1)
+  Index Cond: (card_id = 1)
+  Heap Fetches: 5
+  Buffers: shared hit=1 read=3
+  Execution Time: 0.040 ms
+```
+
+На большой БД `Heap Fetches: 5` — 5 строк, 5 заходов в таблицу. После `VACUUM` было бы 0. Почему — сейчас разберём.
+
+### Visibility Map: почему Index Only Scan не всегда «Only»
+
+PostgreSQL использует **Visibility Map** — битовую карту, которая отмечает страницы, где все строки видны всем активным транзакциям (MVCC). Если страница «чистая» — Index Only Scan не идёт в таблицу. Если «грязная» — заглядывает в heap за каждой строкой.
+
+**Эксперимент: создаём грязные страницы и чистим их:**
+
+```sql
+-- После INSERT все страницы чистые (благодаря VACUUM в init-скриптах)
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT card_id, amount FROM transactions WHERE card_id = 1;
+-- Heap Fetches: 0 ← всё чисто
+
+-- Делаем UPDATE — страницы становятся «грязными»
+UPDATE transactions SET amount = amount WHERE card_id = 1;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT card_id, amount FROM transactions WHERE card_id = 1;
+-- Heap Fetches: 70 ← полезли в таблицу!
+
+-- VACUUM обновляет Visibility Map
+VACUUM transactions;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT card_id, amount FROM transactions WHERE card_id = 1;
+-- Heap Fetches: 0 ← снова чисто
+```
+
+Реальные цифры (малая БД):
+
+| Шаг | Heap Fetches | Buffers | Execution Time |
+|-----|-------------|---------|---------------|
+| После INSERT | 0 | 3 hit | 0.038 ms |
+| После UPDATE | **70** | 73 hit | 0.116 ms |
+| После VACUUM | **0** | 3 hit | 0.038 ms |
+
+`UPDATE` → `Heap Fetches: 70` — 25 строк, но 70 заходов (строки на нескольких страницах, каждая проверяется). `VACUUM` → `0` — страницы снова чистые.
+
+Именно поэтому в наших init-скриптах есть `VACUUM` после загрузки данных. Без него даже покрывающий индекс будет читать таблицу.
 
 ---
 
