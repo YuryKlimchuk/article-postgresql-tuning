@@ -89,9 +89,41 @@ SELECT * FROM transactions WHERE currency_numeric = 643;
 - `seq_page_cost` (по умолчанию 1.0) — стоимость последовательного чтения страницы
 - `random_page_cost` (по умолчанию 4.0) — стоимость случайного чтения страницы
 
-**Правило:** Если планировщик estime, что нужно выбрать **> 5-15% строк**, он может выбрать Seq Scan. Точный порог зависит от `random_page_cost`, размера таблицы и распределения данных.
+**Правило:** Если планировщик оценивает, что нужно выбрать **> 5-15% строк**, он может выбрать Seq Scan. Точный порог зависит от `random_page_cost` (по умолчанию 4.0) и `effective_cache_size`. На SSD `random_page_cost` часто снижают до 1.5 — тогда порог становится ниже, и Seq Scan включается раньше.
 
 **Проверьте на малой БД:** Там тоже будет Seq Scan, но выполнится он мгновенно. Это показывает, почему проблемы производительности не видны на тестовом окружении.
+
+### Эксперимент: меняем random_page_cost и наблюдаем смену плана
+
+Самый наглядный способ понять влияние `random_page_cost` — поменять его на лету и увидеть, как PostgreSQL передумал:
+
+```sql
+-- Шаг 1. Смотрим текущий план (скорее всего Seq Scan, потому что 20% строк)
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE currency_numeric = 643;
+
+-- Шаг 2. Делаем случайные чтения «дешёвыми» (как на SSD)
+SET random_page_cost = 1.0;
+
+-- Шаг 3. Тот же запрос — теперь планировщик может выбрать Index Scan!
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE currency_numeric = 643;
+
+-- Шаг 4. Возвращаем на место
+SET random_page_cost = 4.0;
+```
+
+Если на ваших данных план не изменился (скажем, выборка слишком велика даже для `random_page_cost = 1.0`), попробуйте более избирательное условие:
+
+```sql
+-- Меньше строк = планировщик более чувствителен к random_page_cost
+SET random_page_cost = 1.0;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE card_id BETWEEN 1 AND 10;
+SET random_page_cost = 4.0;
+```
+
+Этот эксперимент стоит запомнить: **на SSD `random_page_cost = 1.0–1.5` — не прихоть, а правильная настройка**, отражающая реальную скорость вашего железа. Если у вас продакшен на SSD, а `random_page_cost` всё ещё 4.0 — планировщик будет избегать индексов там, где они реально быстрее.
 
 ### Parallel Seq Scan
 
@@ -104,6 +136,8 @@ Gather  (cost=0.00..123456.78 rows=1000000 width=120)
 ```
 
 PostgreSQL запускает несколько воркеров для параллельного чтения таблицы. Это ускоряет запрос, но потребляет больше CPU. Количество воркеров зависит от параметра `max_parallel_workers_per_gather` (по умолчанию 2).
+
+> **Примечание:** если работаете в Docker с ограниченным CPU, Parallel Seq Scan может не активироваться. Проверьте `SHOW max_parallel_workers_per_gather;` — если 0, PostgreSQL на вашей конфигурации решил не распараллеливать.
 
 ---
 
@@ -142,20 +176,33 @@ Index Scan using idx_transactions_card_id on transactions
   Buffers: shared hit=10 read=5
 ```
 
-**Сравните время** с Seq Scan на том же запросе (если бы индекса не было). Разница будет в разы, особенно на большой БД.
+**Хотите увидеть, насколько Index Scan быстрее Seq Scan?** Временно отключите индекс-скан — и PostgreSQL будет вынужден использовать Seq Scan:
+
+```sql
+-- Отключаем Index Scan
+SET enable_indexscan = OFF;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE card_id = 1;
+-- ← Seq Scan, смотрите на actual time
+
+SET enable_indexscan = ON;  -- возвращаем обратно
+```
+
+Разница во времени будет в десятки раз, особенно на большой БД.
 
 ### Реальные ID для тестов
 
-В наших данных ID начинаются не с 1, а с случайных значений. Чтобы получить реальный ID для теста:
+В наших данных `BIGSERIAL` генерирует ID начиная с 1, так что `card_id = 1` точно существует. Можно использовать любой заведомо существующий ID или взять случайный:
 
 ```sql
--- Получаем существующий card_id
-SELECT card_id FROM transactions LIMIT 1;
+-- Самый простой вариант: ID гарантированно начинаются с 1
+SELECT * FROM transactions WHERE card_id = 1;
 
--- Используем его в запросе
+-- Или взять случайный ID подзапросом
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM transactions 
-WHERE card_id = (SELECT card_id FROM transactions LIMIT 1);
+WHERE card_id = (SELECT card_id FROM transactions OFFSET floor(random() * 100) LIMIT 1);
 ```
 
 ---
@@ -191,6 +238,9 @@ PostgreSQL всё равно идёт в таблицу за `amount` (его н
 
 ```sql
 CREATE INDEX idx_tx_card_amount ON transactions(card_id, amount);
+
+-- Обновляем статистику, чтобы планировщик знал о новом индексе
+ANALYZE transactions;
 ```
 
 Теперь тот же запрос:
@@ -210,9 +260,17 @@ Index Only Scan using idx_tx_card_amount on transactions
 
 ### Ограничение: Visibility Map
 
-Index Only Scan не всегда работает идеально. PostgreSQL должен проверить, видна ли строка текущей транзакции (MVCC). Для этого используется **Visibility Map**. Если данные «старые» и уже vacuumed, Index Only Scan сработает. Если нет — PostgreSQL всё равно заглянет в таблицу.
+Index Only Scan не всегда работает идеально. PostgreSQL использует **Visibility Map** — битовую карту, которая отмечает страницы, где все строки видны всем активным транзакциям. Если страница «чистая» (все транзакции завершены, не было UPDATE/DELETE), Index Only Scan не идёт в таблицу. Если страница «грязная» — PostgreSQL всё равно заглянет в heap, чтобы проверить видимость конкретной строки.
 
-В выводе вы увидите строку `Heap Fetches: N` — сколько раз пришлось идти в таблицу. В идеале `Heap Fetches: 0`.
+Именно поэтому в скриптах инициализации мы добавили `VACUUM` после загрузки данных — он обновляет Visibility Map. Без `VACUUM` даже покрывающий индекс будет ходить в таблицу.
+
+В выводе `EXPLAIN (ANALYZE, BUFFERS)` смотрите на строку:
+
+```
+Heap Fetches: 42
+```
+
+Это количество заходов в таблицу. В идеале — `Heap Fetches: 0`.
 
 ---
 
@@ -303,6 +361,9 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE INDEX idx_users_email_trgm ON users USING gin(email gin_trgm_ops);
 
+-- Обновляем статистику
+ANALYZE users;
+
 -- Теперь используется Bitmap Index Scan по GIN!
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM users WHERE email LIKE '%user1%';
@@ -321,6 +382,9 @@ SELECT * FROM users WHERE lower(email) = 'user1@test.com';
 
 ```sql
 CREATE INDEX idx_users_email_lower ON users(lower(email));
+
+-- Обновляем статистику
+ANALYZE users;
 
 -- Теперь Index Scan!
 EXPLAIN (ANALYZE, BUFFERS)
@@ -349,12 +413,139 @@ B-tree индекс **не поможет** для поиска внутри JSO
 ```sql
 CREATE INDEX idx_users_names ON users USING gin(localized_names);
 
+-- Обновляем статистику
+ANALYZE users;
+
 -- Теперь Bitmap Index Scan по GIN!
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM users WHERE localized_names->>'en' = 'Customer 42';
 ```
 
 GIN-индекс позволяет быстро искать по ключам и значениям внутри JSONB.
+
+---
+
+## 8. Width — скрытый фактор производительности
+
+Обратите внимание на метрику `width` в выводе `EXPLAIN`:
+
+```
+Index Scan using idx_transactions_card_id on transactions
+  (cost=0.28..8.30 rows=5 width=120)
+```
+
+`width=120` — это **средний размер строки в байтах** на этом шаге плана. Почему это важно?
+
+### Как PostgreSQL хранит данные
+
+PostgreSQL хранит данные на **страницах по 8 КБ** (8192 байта). Таблица — это набор страниц. Когда PostgreSQL читает таблицу, он читает страницы целиком, даже если нужна одна строка.
+
+Простая арифметика:
+- Строка 100 байт → на страницу помещается **~80 строк**
+- Строка 400 байт → на страницу помещается **~20 строк**
+
+**Меньше размер строки → больше строк на странице → меньше страниц читать → меньше I/O.**
+
+### Практический пример: BIGINT vs SMALLINT
+
+Создадим две тестовые таблицы с одинаковыми данными, но разными типами:
+
+```sql
+-- Таблица с «тяжёлыми» типами
+CREATE TABLE test_heavy (
+    id BIGINT PRIMARY KEY,
+    amount BIGINT,
+    status BIGINT,
+    created_at TIMESTAMP
+);
+
+-- Таблица с минимально достаточными типами
+CREATE TABLE test_light (
+    id INT PRIMARY KEY,
+    amount INT,
+    status SMALLINT,
+    created_at DATE
+);
+
+-- Наполняем одинаковыми данными
+INSERT INTO test_heavy
+SELECT i, (random() * 10000)::BIGINT, (random() * 3)::BIGINT, NOW() - (random() * 365)::INT * INTERVAL '1 day'
+FROM generate_series(1, 100000) AS i;
+
+INSERT INTO test_light
+SELECT i, (random() * 10000)::INT, (random() * 3)::SMALLINT, (NOW() - (random() * 365)::INT * INTERVAL '1 day')::DATE
+FROM generate_series(1, 100000) AS i;
+
+-- Сравниваем размер таблиц
+SELECT
+    relname,
+    pg_size_pretty(pg_total_relation_size(oid)) AS total_size,
+    pg_size_pretty(pg_relation_size(oid)) AS table_size
+FROM pg_class
+WHERE relname IN ('test_heavy', 'test_light');
+```
+
+Пример результата:
+
+```
+  relname   | total_size | table_size
+------------+------------+------------
+ test_heavy | 6240 kB    | 5120 kB
+ test_light | 4200 kB    | 3640 kB
+```
+
+Разница в **1.5 раза** на 100K строк — только за счёт правильного выбора типов. На миллионах строк это гигабайты.
+
+Теперь `EXPLAIN` подтверждает:
+
+```sql
+EXPLAIN SELECT * FROM test_heavy;
+-- width=48
+
+EXPLAIN SELECT * FROM test_light;
+-- width=22
+```
+
+`width` меньше в 2 раза → на той же странице в 2 раза больше строк. Производительность растёт без единого индекса.
+
+### Реальный пример из нашей схемы: SELECT * vs выбор колонок
+
+В таблице `transactions` поле `description` типа `TEXT` заполнено «тяжёлыми» данными — `repeat('Lorem ipsum...', 5)`. Посмотрим, как это влияет:
+
+```sql
+-- SELECT * — тянет всё, включая description
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions WHERE card_id = 1;
+-- width=120+, Buffers: больше страниц
+
+-- Только нужные колонки — без description
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, card_id, amount, currency_alpha, transaction_time
+FROM transactions WHERE card_id = 1;
+-- width=40-50, Buffers: меньше страниц
+```
+
+Вы увидите: тот же Index Scan, тот же `card_id = 1`, но `width` меньше в 2-3 раза, и `Buffers` — тоже меньше. PostgreSQL читает меньше страниц, потому что не тащит TOAST-значения.
+
+### Правила оптимизации width
+
+**Выбирайте минимально достаточный тип:**
+
+| Вместо | Используйте | Экономия |
+|--------|-------------|----------|
+| `BIGINT` (8 байт) | `INT` (4 байта) или `SMALLINT` (2 байта) | 2-4× |
+| `TIMESTAMP` (8 байт) | `DATE` (4 байта) — если время не нужно | 2× |
+| `VARCHAR(255)` | Реальный лимит: `VARCHAR(100)` для email | Размер на диске тот же, но constraint честнее |
+
+**Не используйте `SELECT *` в продакшене:**
+- Забирайте только нужные колонки
+- Особенно важно для таблиц с `TEXT` / `JSONB` / `BYTEA` — они могут быть в TOAST
+- Даже Index Only Scan не спасёт, если выбираете колонки, не входящие в индекс
+
+**Избавляйтесь от избыточных полей:**
+- `VARCHAR(200)` для email? Достаточно `VARCHAR(100)`
+- `BIGINT` для справочника из 100 записей? Достаточно `SMALLINT`
+- Дублирующиеся данные в JSONB, которые можно вынести в отдельную таблицу
 
 ---
 
@@ -365,7 +556,7 @@ GIN-индекс позволяет быстро искать по ключам 
 | **Seq Scan** | Маленькая таблица ИЛИ большая выборка (>5-15%) | Простой, последовательное чтение | Медленный на больших таблицах |
 | **Index Scan** | Точечный запрос или малая выборка | Быстрый для малых выборок | Случайные чтения в таблицу |
 | **Index Only Scan** | Все колонки в индексе | Не ходит в таблицу | Требует покрывающего индекса |
-| **Bitmap Scan** | Средняя выборка, несколько условий | Эффективен для множества строк | Дополнительная память для битовой карты |
+| **Bitmap Heap Scan** | Средняя выборка, несколько условий | Эффективен для множества строк | Дополнительная память для битовой карты |
 
 ---
 
