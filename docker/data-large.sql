@@ -1,5 +1,8 @@
 \timing on
 
+SET jit = OFF;
+SET max_parallel_workers_per_gather = 0;
+
 -- ============================================
 -- CARD TEMPLATES (30 records)
 -- ============================================

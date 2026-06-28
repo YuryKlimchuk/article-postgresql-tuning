@@ -392,10 +392,10 @@ Index Scan using idx_tx_card_amount_include on transactions
 
 В следующей серии — **JOIN-ы**: как PostgreSQL соединяет таблицы и почему тип внешнего ключа (INT vs UUID vs VARCHAR) меняет скорость JOIN в 10 раз. Nested Loop, Hash Join, Merge Join — всё на реальных цифрах из нашей схемы.
 
-Весь код серии доступен в [репозитории](https://github.com/YuryKlimchuk/article-postgresql-tuning).
+Исходные файлы серии доступны в [репозитории](https://github.com/YuryKlimchuk/article-postgresql-tuning).
 
 ---
 
 **Конец серии о сканировании.**
 
-*Если статьи были полезными — ставьте 👏, подписывайтесь и делитесь с коллегами. Вопросы и замечания — в комментариях.*
+*Вопросы и замечания — в комментариях. Исходные файлы — в [репозитории](https://github.com/YuryKlimchuk/article-postgresql-tuning).*

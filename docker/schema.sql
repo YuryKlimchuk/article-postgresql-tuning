@@ -10,7 +10,7 @@ CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
     email VARCHAR(100) NOT NULL,
-    localized_names JSONB,  -- {"en": "John Doe", "ru": "Иван Иванов"}
+    localized_names JSONB,  -- {"en": "John Doe", "ru": "Ivan Ivanov"}
     created_at TIMESTAMP DEFAULT NOW()
 );
 
