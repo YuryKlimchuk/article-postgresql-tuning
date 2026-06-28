@@ -917,22 +917,41 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM users WHERE email LIKE '%user1%';
 ```
 
-B-tree индекс **не поможет**, потому что `%` в начале строки означает, что индекс не может использовать сортировку.
+B-tree индекс не поможет — `%` в начале означает, что индекс не может использовать сортировку.
 
-**Решение:** GIN-индекс с расширением `pg_trgm` (триграммы):
+**Большая БД (500K users, без GIN):**
+
+```
+Seq Scan on users
+  (actual time=0.383..75.121 rows=111111 loops=1)
+  Filter: ((email)::text ~~ '%user1%'::text)
+  Rows Removed by Filter: 388889
+  Buffers: read=11016
+  Execution Time: 77.960 ms
+```
+
+**Решение:** GIN-индекс с расширением `pg_trgm` (триграммы — тройки символов):
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
 CREATE INDEX idx_users_email_trgm ON users USING gin(email gin_trgm_ops);
-
--- Обновляем статистику
 ANALYZE users;
-
--- Теперь используется Bitmap Index Scan по GIN!
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM users WHERE email LIKE '%user1%';
 ```
+
+**После GIN-индекса:**
+
+```
+Bitmap Heap Scan on users
+  (actual time=10.313..26.843 rows=111111 loops=1)
+  Heap Blocks: exact=2463
+  Buffers: shared hit=10 read=2518
+  ->  Bitmap Index Scan on idx_users_email_trgm
+        (actual time=10.082..10.083 rows=111111 loops=1)
+        Buffers: shared hit=10 read=55
+  Execution Time: 29.622 ms
+```
+
+**Результат:** время с 78ms до 30ms (×2.6), буферов с 11 016 до 2 518 (×4.4).
 
 ### Случай 2: Функция в WHERE
 
@@ -941,20 +960,39 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM users WHERE lower(email) = 'user1@test.com';
 ```
 
-Обычный индекс на `email` **не используется**, потому что PostgreSQL не знает, что `lower(email)` можно индексировать.
+Обычный индекс на `email` **не используется** — PostgreSQL не знает, что `lower(email)` эквивалентно чему-то проиндексированному.
 
-**Решение:** Функциональный индекс:
+**Большая БД (500K users, без функционального индекса):**
+
+```
+Seq Scan on users
+  (actual time=0.308..143.290 rows=1 loops=1)
+  Filter: (lower((email)::text) = 'user1@test.com'::text)
+  Rows Removed by Filter: 499999
+  Buffers: shared hit=128 read=10888
+  Execution Time: 143.311 ms
+```
+
+Прочитано 500K строк, найдена одна — почти полсекунды на пустом месте.
+
+**Решение:** функциональный индекс:
 
 ```sql
 CREATE INDEX idx_users_email_lower ON users(lower(email));
-
--- Обновляем статистику
 ANALYZE users;
-
--- Теперь Index Scan!
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM users WHERE lower(email) = 'user1@test.com';
 ```
+
+**После:**
+
+```
+Index Scan using idx_users_email_lower on users
+  (actual time=0.022..0.022 rows=1 loops=1)
+  Index Cond: (lower((email)::text) = 'user1@test.com'::text)
+  Buffers: read=4
+  Execution Time: 0.038 ms
+```
+
+**Результат:** время с 143ms до 0.038ms (**×3 770**), буферов с 11 016 до 4.
 
 ### Случай 3: JSONB-поиск
 
@@ -964,29 +1002,57 @@ SELECT * FROM users WHERE lower(email) = 'user1@test.com';
 {"en": "Customer 42", "ru": "Пользователь 42", "zh": "用户 42"}
 ```
 
-Обычный запрос:
+**Большая БД (500K users, без GIN):**
 
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM users WHERE localized_names->>'en' = 'Customer 42';
+```
+Seq Scan on users
+  (actual time=0.020..75.689 rows=1 loops=1)
+  Filter: ((localized_names ->> 'en'::text) = 'Customer 42'::text)
+  Rows Removed by Filter: 499999
+  Buffers: shared hit=257 read=10759
+  Execution Time: 75.707 ms
 ```
 
-B-tree индекс **не поможет** для поиска внутри JSON.
-
-**Решение:** GIN-индекс на JSONB:
+**Решение:** GIN-индекс на JSONB. Важно: для поиска нужно использовать оператор `@>`, а не `->>`:
 
 ```sql
 CREATE INDEX idx_users_names ON users USING gin(localized_names);
-
--- Обновляем статистику
 ANALYZE users;
 
--- Теперь Bitmap Index Scan по GIN!
+-- Правильный оператор для JSONB с GIN-индексом
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM users WHERE localized_names->>'en' = 'Customer 42';
+SELECT * FROM users WHERE localized_names @> '{"en": "Customer 42"}';
 ```
 
-GIN-индекс позволяет быстро искать по ключам и значениям внутри JSONB.
+**После:**
+
+```
+Bitmap Heap Scan on users
+  (actual time=0.096..0.096 rows=1 loops=1)
+  Recheck Cond: (localized_names @> '{"en": "Customer 42"}'::jsonb)
+  Heap Blocks: exact=1
+  Buffers: shared hit=5 read=5
+  ->  Bitmap Index Scan on idx_users_names
+        (actual time=0.090..0.090 rows=1 loops=1)
+        Buffers: shared hit=4 read=5
+  Execution Time: 0.132 ms
+```
+
+**Результат:** время с 75.7ms до 0.132ms (**×573**), буферов с 11 016 до 10.
+
+---
+
+Сводка по всем трём случаям:
+
+| Случай | До (Seq Scan) | После (с индексом) | Ускорение |
+|--------|---------------|-------------------|-----------|
+| `LIKE '%user1%'` | 77.9 ms | 29.6 ms | **×2.6** |
+| `lower(email) = ...` | 143.3 ms | 0.038 ms | **×3 770** |
+| `JSONB @> ...` | 75.7 ms | 0.132 ms | **×573** |
+
+**Итог:** B-tree покрывает 99% случаев, но есть ситуации, где нужны специализированные индексы. `LIKE '%...'` → pg_trgm + GIN. Функции в WHERE → функциональный индекс. JSONB-поиск → GIN с оператором `@>`. Не создавайте такие индексы превентивно — только когда `pg_stat_statements` показал медленный запрос.
+
+В финальном разделе — width: как размер строки влияет на производительность, и почему `SELECT *` на таблице с TOAST-полями убивает даже Index Scan.
 
 ---
 
