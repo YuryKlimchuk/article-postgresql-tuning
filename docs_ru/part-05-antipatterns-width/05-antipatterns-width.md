@@ -20,7 +20,7 @@ SELECT * FROM users WHERE email LIKE '%user1%';
 
 B-tree индекс не поможет — `%` в начале означает, что индекс не может использовать сортировку.
 
-**Большая БД (500K users, без GIN):**
+### Большая БД (500K users, без GIN)
 
 ```
 Seq Scan on users
@@ -39,7 +39,7 @@ CREATE INDEX idx_users_email_trgm ON users USING gin(email gin_trgm_ops);
 ANALYZE users;
 ```
 
-**После GIN-индекса:**
+### После GIN-индекса
 
 ```
 Bitmap Heap Scan on users
@@ -77,7 +77,7 @@ SELECT * FROM users WHERE lower(email) = 'user1@test.com';
 
 Обычный индекс на `email` **не используется** — PostgreSQL не знает, что `lower(email)` эквивалентно чему-то проиндексированному.
 
-**Большая БД (500K users, без функционального индекса):**
+### Большая БД (500K users, без функционального индекса)
 
 ```
 Seq Scan on users
@@ -97,7 +97,7 @@ CREATE INDEX idx_users_email_lower ON users(lower(email));
 ANALYZE users;
 ```
 
-**После:**
+### После
 
 ```
 Index Scan using idx_users_email_lower on users
@@ -117,7 +117,7 @@ Index Scan using idx_users_email_lower on users
 {"en": "Customer 42", "ru": "Пользователь 42", "zh": "用户 42"}
 ```
 
-**Большая БД (500K users, без GIN):**
+### Большая БД (500K users, без GIN)
 
 ```
 Seq Scan on users
@@ -139,7 +139,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM users WHERE localized_names @> '{"en": "Customer 42"}';
 ```
 
-**После:**
+### После
 
 ```
 Bitmap Heap Scan on users
@@ -175,7 +175,7 @@ Bitmap Heap Scan on users
 | `lower(email) = ...` | 143.3 ms | 0.038 ms | **×3 770** |
 | `JSONB @> ...` | 75.7 ms | 0.132 ms | **×573** |
 
-**Итоговый чек-лист:**
+### Итоговый чек-лист
 
 - `LIKE '%pattern%'` или `ILIKE` → pg_trgm + GIN (×2-10 для больших выборок, ×100+ для точечных)
 - Функция в `WHERE` → функциональный индекс (×1000+ для точечных запросов)
@@ -209,7 +209,7 @@ Index Scan using idx_transactions_card_id on transactions
 - **Padding** — выравнивание до границы 8 байт (процессор быстрее читает выровненные данные)
 - **TOAST pointer** — если поле не влезает в страницу, хранится только указатель (18 байт)
 
-**Пример расчёта для нашей таблицы `transactions`:**
+### Пример расчёта для нашей таблицы `transactions`
 
 | Поле | Тип | Размер |
 |------|-----|--------|
@@ -306,7 +306,7 @@ EXPLAIN SELECT * FROM test_light;
 
 В таблице `transactions` поле `description` типа `TEXT` заполнено «тяжёлыми» данными — `repeat('Lorem ipsum...', 5)`. Посмотрим, как это влияет на большой БД:
 
-**SELECT \* (все колонки, включая description):**
+### SELECT \* (все колонки, включая description)
 
 ```
 Index Scan using idx_tx_card_amount_include on transactions
@@ -317,7 +317,7 @@ Index Scan using idx_tx_card_amount_include on transactions
   Execution Time: 0.192 ms
 ```
 
-**SELECT колонок (без description):**
+### SELECT колонок (без description)
 
 ```
 Index Scan using idx_tx_card_amount_include on transactions
@@ -332,7 +332,7 @@ Index Scan using idx_tx_card_amount_include on transactions
 
 ### Правила оптимизации width
 
-**Выбирайте минимально достаточный тип:**
+### Выбирайте минимально достаточный тип
 
 | Вместо | Используйте | Экономия |
 |--------|-------------|----------|
@@ -340,7 +340,7 @@ Index Scan using idx_tx_card_amount_include on transactions
 | `TIMESTAMP` (8 байт) | `DATE` (4 байта) — если время не нужно | 2× |
 | `VARCHAR(255)` | Реальный лимит: `VARCHAR(100)` для email | В PostgreSQL `VARCHAR(n)` хранит только реальные символы — `VARCHAR(255)` и `VARCHAR(100)` занимают одинаково для коротких строк. Но ограничение в 100 защищает от случайных ошибок и делает схему понятнее. |
 
-**Сколько весят типы данных PostgreSQL:**
+### Сколько весят типы данных PostgreSQL
 
 | Тип | Байт |
 |-----|------|
@@ -353,12 +353,12 @@ Index Scan using idx_tx_card_amount_include on transactions
 | `CHAR(n)` | n + padding до 4 байт |
 | `VARCHAR(n)` / `TEXT` | 4 байта заголовка + длина строки. Если > 2 КБ → TOAST pointer (18 байт) |
 
-**Не используйте `SELECT *` в продакшене:**
+### Не используйте `SELECT *` в продакшене
 - Забирайте только нужные колонки
 - Особенно важно для таблиц с `TEXT` / `JSONB` / `BYTEA` — они могут быть в TOAST
 - Даже Index Only Scan не спасёт, если выбираете колонки, не входящие в индекс
 
-**Избавляйтесь от избыточных полей:**
+### Избавляйтесь от избыточных полей
 - `VARCHAR(200)` для email? Достаточно `VARCHAR(100)`
 - `BIGINT` для справочника из 100 записей? Достаточно `SMALLINT`
 - Дублирующиеся данные в JSONB, которые можно вынести в отдельную таблицу

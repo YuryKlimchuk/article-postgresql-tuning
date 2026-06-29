@@ -24,7 +24,7 @@ PostgreSQL использует двухфазный трюк:
 
 Вернёмся к эксперименту из раздела 2. Одна валюта (20% строк) на малой БД — это Bitmap Heap Scan:
 
-**Малая БД (50K строк, 1 валюта = 10 000 строк / 20%):**
+### Малая БД (50K строк, 1 валюта = 10 000 строк / 20%)
 
 ```
 Bitmap Heap Scan on transactions
@@ -53,7 +53,7 @@ SELECT * FROM transactions
 WHERE card_id = 1 OR merchant_id = 5;
 ```
 
-**Малая БД:**
+### Малая БД
 
 ```
 Bitmap Heap Scan on transactions
@@ -70,7 +70,7 @@ Bitmap Heap Scan on transactions
   Execution Time: 0.070 ms
 ```
 
-**Большая БД:**
+### Большая БД
 
 ```
 Bitmap Heap Scan on transactions
@@ -119,7 +119,7 @@ Bitmap Heap Scan on transactions
 
 Кошмар: `lossy=155976` страниц из 156251 — почти всё «потеряно». `Rows Removed by Index Recheck: 2 994 736` — 3 миллиона строк прочитано и выброшено при перепроверке.
 
-**Тот же запрос с work_mem = 4MB:**
+### Тот же запрос с work_mem = 4MB
 
 ```
 Bitmap Heap Scan on transactions
@@ -146,7 +146,7 @@ Bitmap Heap Scan on transactions
 
 Общее количество страниц одинаковое — разница только в точности битовой карты.
 
-**Как настраивать work_mem:**
+### Как настраивать work_mem
 
 Для сессии:
 
@@ -243,7 +243,7 @@ BRIN идеален для запросов вида `WHERE transaction_time > N
 
 **BRIN в деле:** сравним B-tree и BRIN на диапазонном запросе по большой БД (5M строк, ~400K за последние 30 дней):
 
-**B-tree (idx_transactions_time, 107 MB):**
+### B-tree (idx_transactions_time, 107 MB)
 
 ```
 Bitmap Heap Scan on transactions
@@ -255,7 +255,7 @@ Bitmap Heap Scan on transactions
   Execution Time: 864.232 ms
 ```
 
-**BRIN (idx_tx_time_brin, 56 KB):**
+### BRIN (idx_tx_time_brin, 56 KB)
 
 ```
 Bitmap Heap Scan on transactions
@@ -291,7 +291,7 @@ BRIN медленнее (1107 ms vs 864 ms) и вынужден перепров
   → B-tree (составной, если нужно)
 ```
 
-**В нашей схеме:**
+### В нашей схеме
 - `users.uuid` — кандидат на Hash-индекс (только равенство, не нужна сортировка)
 - `users.localized_names` (JSONB) — кандидат на GIN (поиск внутри JSON)
 - `transactions.transaction_time` — кандидат на BRIN (хронологические данные)

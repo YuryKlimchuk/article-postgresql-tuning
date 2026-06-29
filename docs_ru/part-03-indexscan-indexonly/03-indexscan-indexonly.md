@@ -52,7 +52,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM transactions WHERE card_id = 1;
 ```
 
-**Малая БД (50K строк, 25 транзакций для card_id=1):**
+### Малая БД (50K строк, 25 транзакций для card_id=1)
 
 ```
 Index Scan using idx_transactions_card_id on transactions
@@ -63,7 +63,7 @@ Index Scan using idx_transactions_card_id on transactions
   Execution Time: 0.068 ms
 ```
 
-**Большая БД (5M строк, 5 транзакций для card_id=1):**
+### Большая БД (5M строк, 5 транзакций для card_id=1)
 
 ```
 Index Scan using idx_transactions_card_id on transactions
@@ -177,7 +177,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT card_id, amount FROM transactions WHERE card_id = 1;
 ```
 
-**Малая БД:**
+### Малая БД
 
 ```
 Index Scan using idx_transactions_card_id on transactions
@@ -202,7 +202,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT card_id, amount FROM transactions WHERE card_id = 1;
 ```
 
-**Малая БД:**
+### Малая БД
 
 ```
 Index Only Scan using idx_tx_card_amount on transactions
@@ -229,7 +229,7 @@ Index Only Scan using idx_tx_card_amount on transactions
 
 \* `read=2` — индекс ещё не в кэше, при повторе будет `hit`.
 
-**На большой БД разница радикальна:**
+### На большой БД разница радикальна
 
 | Метрика | Index Scan (большая БД) | Index Only Scan, INCLUDE (большая БД) |
 |---------|------------------------|--------------------------------------|
@@ -254,7 +254,7 @@ CREATE INDEX idx_tx_card_amount_include ON transactions(card_id) INCLUDE (amount
 - Поиск идёт только по `card_id` — B-tree компактный
 - `amount` лежит в листьях — Index Only Scan работает
 
-**Малая БД:**
+### Малая БД
 
 ```
 Index Only Scan using idx_tx_card_amount_include on transactions
@@ -266,7 +266,7 @@ Index Only Scan using idx_tx_card_amount_include on transactions
   Execution Time: 0.036 ms
 ```
 
-**Большая БД:**
+### Большая БД
 
 ```
 Index Only Scan using idx_tx_card_amount_include on transactions
@@ -286,7 +286,7 @@ Index Only Scan using idx_tx_card_amount_include on transactions
 
 PostgreSQL использует **Visibility Map** — битовую карту, которая отмечает страницы, где все строки видны всем активным транзакциям (MVCC). Если страница «чистая» — Index Only Scan не идёт в таблицу. Если «грязная» — заглядывает в heap за каждой строкой.
 
-**Эксперимент: создаём грязные страницы и чистим их:**
+### Эксперимент: создаём грязные страницы и чистим их
 
 ```sql
 -- После INSERT все страницы чистые (благодаря VACUUM в init-скриптах)
