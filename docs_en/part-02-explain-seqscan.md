@@ -265,7 +265,7 @@ If you enable parallel workers (`max_parallel_workers_per_gather = 2` — the de
 
 ## What's Next
 
-Seq Scan is the simplest method. In **Part 3**, we move on to indexes: how B-tree works, why Index Scan is 800× faster than Seq Scan at scale, and how covering indexes let you skip the table entirely.
+Seq Scan is the simplest method. In **Part 3**, we move on to indexes: how B-tree works, why Index Scan is hundreds and thousands of times faster than Seq Scan at scale, and how covering indexes let you skip the table entirely.
 
 **In short:** Seq Scan reads everything, time scales linearly, default `shared_buffers` won't save you. Indexes are the next step.
 
