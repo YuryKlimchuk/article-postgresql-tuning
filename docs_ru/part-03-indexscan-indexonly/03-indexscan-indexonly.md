@@ -5,12 +5,12 @@
 
 **В этой части:** B-tree — основной индекс PostgreSQL, как он устроен и почему Index Scan в сотни раз быстрее Seq Scan. А затем — покрывающие индексы (Index Only Scan), которые вообще не ходят в таблицу.
 
-> **Настройка для всех запросов ниже:** как и в части 2, отключаем JIT и параллельные воркеры, обновляем статистику:
-> ```sql
-> SET jit = OFF;
-> SET max_parallel_workers_per_gather = 0;
-> ANALYZE transactions;
-> ```
+```sql
+-- Отключаем JIT и параллельные воркеры, обновляем статистику (как в части 2)
+SET jit = OFF;
+SET max_parallel_workers_per_gather = 0;
+ANALYZE transactions;
+```
 
 ---
 
@@ -58,7 +58,8 @@ Index Scan using idx_transactions_card_id on transactions
   (actual time=0.014..0.017 rows=25 loops=1)
   Index Cond: (card_id = 1)
   Buffers: shared hit=3
-  Execution Time: 0.034 ms
+ Planning Time: 0.083 ms
+ Execution Time: 0.034 ms
 ```
 
 ### Большая БД (5M строк, 5 транзакций для card_id=1)
@@ -69,7 +70,8 @@ Index Scan using idx_transactions_card_id on transactions
   (actual time=0.014..0.015 rows=5 loops=1)
   Index Cond: (card_id = 1)
   Buffers: shared hit=4
-  Execution Time: 0.028 ms
+ Planning Time: 0.032 ms
+ Execution Time: 0.028 ms
 ```
 
 Обратите внимание: `cost` на обеих БД почти одинаков (`0.29..8.73` vs `0.43..8.80`). Планировщик знает: Index Scan не зависит от размера таблицы — он зависит только от глубины B-tree и количества найденных строк.
@@ -92,19 +94,19 @@ SELECT * FROM transactions WHERE card_id = 1;
 
 SET enable_indexscan = ON;
 SET enable_bitmapscan = ON;
-SET max_parallel_workers_per_gather = 2;
+SET max_parallel_workers_per_gather = 0;
 ```
 
 Результаты:
 
 | Метрика | Малая БД (Index Scan) | Малая БД (Seq Scan) | Большая БД (Index Scan) | Большая БД (Seq Scan) |
 |---------|----------------------|---------------------|------------------------|----------------------|
-| **Execution Time** | 0.027 ms | 7.374 ms | 0.022 ms | 388.290 ms |
-| **Разница** | — | **×273 медленнее** | — | **×17 650 медленнее** |
+| **Execution Time** | 0.034 ms | 7.374 ms | 0.028 ms | 388.290 ms |
+| **Разница** | — | **×217 медленнее** | — | **×13 867 медленнее** |
 | **Buffers** | 3 hit | 1 hit + 1 219 read | 4 hit | 128 hit + 156 122 read |
 | **Rows Removed by Filter** | — | 49 975 | — | 4 999 995 |
 
-Главный вывод: **Index Scan практически не зависит от размера таблицы**. 0.027 ms на 50K строк, 0.022 ms на 5M строк — время одинаковое, хотя данных в 100 раз больше. Это потому что глубина B-tree растёт логарифмически: для 50K строк нужно ~3 уровня дерева, для 5M — ~4 уровня. Seq Scan же читает всю таблицу, поэтому время растёт линейно.
+Главный вывод: **Index Scan практически не зависит от размера таблицы**. 0.034 ms на 50K строк, 0.028 ms на 5M строк — время одинаковое, хотя данных в 100 раз больше. Это потому что глубина B-tree растёт логарифмически: для 50K строк нужно ~3 уровня дерева, для 5M — ~4 уровня. Seq Scan же читает всю таблицу, поэтому время растёт линейно.
 
 Index Scan всегда делает заходы в таблицу (heap) за колонками, которых нет в индексе — это «плата» за универсальность. В следующем разделе мы увидим, как покрывающий индекс устраняет эту проблему.
 
@@ -158,9 +160,38 @@ SELECT * FROM user_cards WHERE user_id = 1 AND status = 'ACTIVE';
 
 Без составного индекса PostgreSQL использует `idx_user_cards_user_id`, но затем фильтрует по `status` — `Rows Removed by Filter` покажет лишнюю работу. С составным индексом `(user_id, status)` фильтрация происходит прямо в индексе.
 
+Реальные цифры (на обеих БД планировщик выбрал существующий индекс `idx_user_cards_user_id` — оба индекса начинаются с `user_id`, для 2 строк разницы нет):
+
+```
+-- Малая БД
+Bitmap Heap Scan on user_cards
+  (cost=4.29..10.55 rows=2 width=62) (actual time=0.033..0.038 rows=2 loops=1)
+  Recheck Cond: (user_id = 1)
+  Filter: ((status)::text = 'ACTIVE'::text)
+  Heap Blocks: exact=2
+  Buffers: shared hit=7
+  ->  Bitmap Index Scan on idx_user_cards_user_id
+        Index Cond: (user_id = 1)
+        Buffers: shared hit=5
+ Planning Time: 0.952 ms
+ Execution Time: 0.089 ms
+
+-- Большая БД (видно Rows Removed by Filter)
+Index Scan using idx_user_cards_user_id on user_cards
+  (cost=0.42..11.49 rows=2 width=62) (actual time=0.031..0.031 rows=1 loops=1)
+  Index Cond: (user_id = 1)
+  Filter: ((status)::text = 'ACTIVE'::text)
+  Rows Removed by Filter: 1
+  Buffers: shared hit=8
+ Planning Time: 0.255 ms
+ Execution Time: 0.058 ms
+```
+
+На большой БД заметна лишняя работа: `Rows Removed by Filter: 1` — фильтрация по `status` происходит в heap, а не в индексе. Для 2 строк на пользователя это копейки, но когда у пользователя сотни карт — разница становится значительной.
+
 Порядок колонок важен: сначала колонки для `=`, потом для `ORDER BY`, потом для диапазонов.
 
-**Итог:** Index Scan — основной рабочий инструмент PostgreSQL. Для точечных запросов он быстрее Seq Scan в сотни и тысячи раз. Но он всегда ходит в таблицу (heap) за данными — и когда нужно прочитать много строк или данных нет в индексе, это становится узким местом. Дальше мы увидим, как покрывающий индекс решает проблему заходов в таблицу (а в части 4 — как битовая карта помогает для промежуточных объёмов).
+**Подведём итог по Index Scan:** это основной рабочий инструмент PostgreSQL. Для точечных запросов он быстрее Seq Scan в сотни и тысячи раз. Но он всегда ходит в таблицу (heap) за данными — и когда нужно прочитать много строк или данных нет в индексе, это становится узким местом. Дальше мы увидим, как покрывающий индекс решает проблему заходов в таблицу (а в части 4 — как битовая карта помогает для промежуточных объёмов).
 
 ---
 
@@ -181,7 +212,8 @@ Index Scan using idx_transactions_card_id on transactions
   (actual time=0.020..0.024 rows=25 loops=1)
   Index Cond: (card_id = 1)
   Buffers: shared hit=3
-  Execution Time: 0.037 ms
+ Planning Time: 0.039 ms
+ Execution Time: 0.037 ms
 ```
 
 `width=14` (только card_id + amount, без description), но всё равно Index Scan — потому что `amount` нет в индексе. Index Scan особенно дорог, если в таблице есть TOAST-поля (TEXT, JSONB, BYTEA) — даже когда они не нужны, PostgreSQL читает TOAST-указатели из таблицы.
@@ -207,7 +239,8 @@ Index Only Scan using idx_tx_card_amount on transactions
   Index Cond: (card_id = 1)
   Heap Fetches: 0
   Buffers: shared hit=1 read=2
-  Execution Time: 0.044 ms
+ Planning Time: 0.235 ms
+ Execution Time: 0.044 ms
 ```
 
 `Heap Fetches: 0` — ни одного захода в таблицу! PostgreSQL ответил, используя только индекс.
@@ -225,7 +258,32 @@ Index Only Scan using idx_tx_card_amount on transactions
 
 \* `read=2` — индекс ещё не в кэше, при повторе будет `hit`.
 
+Повторный запуск (индекс уже в кэше):
+
+```
+Index Only Scan using idx_tx_card_amount on transactions
+  (cost=0.29..4.73 rows=25 width=14) (actual time=0.015..0.016 rows=25 loops=1)
+  Index Cond: (card_id = 1)
+  Heap Fetches: 0
+  Buffers: shared hit=3
+ Planning Time: 0.031 ms
+ Execution Time: 0.030 ms
+```
+
 ### Большая БД (покрывающий индекс)
+
+Сначала — Index Scan на большом объёме (для сравнения):
+
+```
+Index Scan using idx_transactions_card_id on transactions
+  (cost=0.43..8.80 rows=21 width=14) (actual time=0.027..0.029 rows=5 loops=1)
+  Index Cond: (card_id = 1)
+  Buffers: shared hit=4
+ Planning Time: 0.047 ms
+ Execution Time: 0.046 ms
+```
+
+Теперь — с покрывающим индексом:
 
 | Метрика | Index Scan (большая БД) | Index Only Scan (большая БД) |
 |---------|------------------------|-----------------------------|
@@ -245,6 +303,7 @@ Index Only Scan using idx_tx_card_amount on transactions
 Решение — **INCLUDE**: колонка хранится в листьях индекса, но не участвует в поиске:
 
 ```sql
+DROP INDEX IF EXISTS idx_tx_card_amount;
 CREATE INDEX idx_tx_card_inc ON transactions(card_id) INCLUDE (amount);
 ```
 
@@ -260,7 +319,8 @@ Index Only Scan using idx_tx_card_inc on transactions
   Index Cond: (card_id = 1)
   Heap Fetches: 0
   Buffers: shared hit=3
-  Execution Time: 0.045 ms
+ Planning Time: 0.259 ms
+ Execution Time: 0.045 ms
 ```
 
 ### Большая БД (INCLUDE-индекс)
@@ -272,7 +332,8 @@ Index Only Scan using idx_tx_card_inc on transactions
   Index Cond: (card_id = 1)
   Heap Fetches: 0
   Buffers: shared hit=4
-  Execution Time: 0.042 ms
+ Planning Time: 0.140 ms
+ Execution Time: 0.042 ms
 ```
 
 `Heap Fetches: 0` на обеих БД — таблица только что создана, VACUUM отработал в init-скриптах, Visibility Map чистая.
@@ -324,7 +385,7 @@ SELECT card_id, amount FROM transactions WHERE card_id = 1;
 | После UPDATE | **10** | 7 hit | 0.058 ms |
 | После VACUUM | **0** | 4 hit | 0.031 ms |
 
-`Heap Fetches` считает не строки, а **заходы в страницы таблицы** для проверки видимости. После UPDATE PostgreSQL не доверяет Visibility Map для этих страниц, поэтому заглядывает в heap. На малой БД 25 строк разбросаны по ~50 страницам (Heap Fetches: 50), на большой БД 5 строк — по ~10 страницам. `VACUUM` → `0` — страницы снова чистые.
+`Heap Fetches` считает не строки, а **заходы в страницы таблицы** для проверки видимости. Почему 50 заходов для 25 строк? `UPDATE` создаёт новые версии кортежей (MVCC). Index Only Scan идёт по индексу к старому TID, видит обновлённую строку и проверяет видимость в heap — как для старой, так и для новой страницы. Отсюда ~2 захода на строку: 25×2≈50 на малой БД, 5×2≈10 на большой. `VACUUM` помечает старые версии как неактуальные и обновляет Visibility Map → `Heap Fetches: 0`.
 
 Именно поэтому в наших init-скриптах есть `VACUUM` после загрузки данных. Без него даже покрывающий индекс будет читать таблицу.
 
