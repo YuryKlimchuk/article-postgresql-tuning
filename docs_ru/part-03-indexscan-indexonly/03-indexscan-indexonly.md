@@ -339,8 +339,6 @@ SELECT card_id, amount FROM transactions WHERE card_id = 1;
 
 Индексы ускоряют точечные запросы в сотни и тысячи раз. Но что делать, когда строк много, но недостаточно для Seq Scan? В **Части 4** — Bitmap Heap Scan: компромисс между индексом и полным сканированием. А также обзор Hash, GIN и BRIN-индексов.
 
-А пока попробуйте Index Only Scan на своих данных. Исходные файлы доступны в [репозитории](https://github.com/YuryKlimchuk/article-postgresql-tuning).
-
 ---
 
 **Продолжение следует...**
